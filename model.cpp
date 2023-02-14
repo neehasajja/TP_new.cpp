@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 
+// Embeddings consists of fully connected NN, with 2 linear layers and ReLu activation function.The Input is the Output of Resnet50 backbne.This module can be used to extract high-level features from the input data and generate emeddings which can be used for prediction and classification.//
 
 class Embeddings : public torch::nn::Module {
 public:
@@ -62,19 +63,23 @@ private:
     torch::nn::Sequential backbone;
 };
 
-class Encoder : public torch::nn::Module {
+//the constructor uses the unordered map taken by the encoder including latent_dim, frame_embedding_dim, and trajectory length//
+
+class Encoder : public torch::nn::Module  {
 public:
    Encoder(const std::unordered_map<std::string, torch::Tensor>& cfg) : 
         latent_dim(cfg.at("latent_dim").item<int>()),
         frame_embedding_dim(cfg.at("frame_embedding_dim").item<int>()),
         trajectory_length(cfg.at("trajectory_length").item<int>()),
         layers_dims({trajectory_length + frame_embedding_dim}),
-        layers(torch::nn::Sequential()),
-        linear_means(torch::nn::Linear(layers_dims.back(), latent_dim)),
-        linear_log_var(torch::nn::Linear(layers_dims.back(), latent_ 
+        layers(torch::nn::Sequential()),// this represents the sequence of NN//
+        linear_means(torch::nn::Linear(layers_dims.back(), latent_dim)), //. These two linear layer areused to calculate the mean and log variance of the latent representation//
+        linear_log_var(torch::nn::Linear(layers_dims.back(), latent_dim)),
+};
 
+//
 class  Decoder : public torch::nn::Module {
- public:
+public:
   Decoder(const std::unordered_map<std::string, int>& cfg) : cfg(cfg) {
     trajectory_length = cfg.at("future_num_frames") * 2;
     std::vector<int> layers = {
