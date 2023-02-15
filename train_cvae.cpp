@@ -1,8 +1,12 @@
 #include <torch/torch.h>
 #include <iostream>
+#include <tqdm/tqdm.h>
+#include <vector>
+#include <cmath>
 #include <numeric>
 
 using namespace std;
+using namespace torch;
 
 // Define a struct for the loss function
 struct LossKLD {
@@ -90,11 +94,38 @@ void train_cvae(torch::nn::Module& model, torch::data::DataLoader<>& data_loader
     int checkpoint_every_n_steps = cfg.at("train_cvae_params.checkpoint_every_n_steps").item<int>();
     bool plot_mode = cfg.at("plot_mode").item<bool>();
 
-    vector<float> losses_train, recon_losses, vlb_losses;
-    for (int i = 0; i < max_num_steps; ++i) {
-        auto data = *data_loader.begin();
-        model.train();
+    auto data_iterator = data_loader.begin();
+    tqdm progress_bar(cfg["train_cvae_params"]["max_num_steps"].item<int>());
 
-        auto outputs = forward_cvae(data, model, device, cfg);
-        auto recon_loss = outputs.at(1).item<float>();
-        auto vlb_loss = outputs.at(2).item<float>();
+    vector<float> losses_train, recon_losses, vlb_losses;
+    for (int i = 0; i < cfg ["train_cvae_params"]["max_num_steps"] (); i++) {
+        torch::Tensor data;
+        try{ 
+          data = *data_iterator;
+          ++data_iterator;
+        }
+        catch(const std::out_of_range &e){
+          data_iterator = data_loader.begin();
+          data = *data_iterator;
+          ++data_iterator;
+        }
+        model.train();
+        torch::set_grad_enabled(true);
+        auto results = forward_cvae(data,model,device,cgf);
+        auto recon_loss = results.first;
+        auto vlb_loss = results.second;
+        auto loss = recon_loss + vlb_loss;
+
+        optimizer.zero_grad();
+        loss.backward();
+        optimizer.step();
+
+        losses_train.push_back(loss.item<float>());
+        recon_losses.push_back(recon_loss.item<float>());
+        vlb_losses.push_back(vlb_loss.item<float>());
+
+        progress_bar.set_description(f"loss:{loss.item<float>()},loss(avg):{accumulate(losses_train.begin(),losses_train.end(), 0.0) / losses_train.size()}";)})
+        if(plot_mode)
+        {cvae_training_monitor(recon_losses,vlb_losses, criterion);
+        }
+}
