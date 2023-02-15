@@ -59,11 +59,28 @@ void train_extractor(
     forward_extractor(cvae_model, extractor_model, data, device, neg_multi_log_likelihood_batch, confs, cfg);
 
     // Backward
+    optimizer.zero_grad();
     loss.backward();
     optimizer.step();
 
     iterations.push_back(i);
-    losses_train.push_back(loss.item().toFloat());  // mean per batch
-    progress_bar.set_description(f'loss: {loss.item().toFloat()}, loss(avg): {torch::mean(torch::tensor(loss
+    losses_train.push_back(loss.item().toDouble());  // mean per batch
+    progress_bar.set_description("loss: " + to_string(loss.item().toDouble()) + ", loss(avg): " + to_string(mean(losses_train).item().toDouble()));
+    clear_output(true);
+    if (plot_mode) {
+        extractor_training_monitor(losses_train);
+    }
 
-
+    if (i % cfg["train_extractor_params"]["checkpoint_every_n_steps"].toInt() == 0 && i > 0) {
+        double mean_loss = mean(losses_train).item().toDouble();
+        save(
+            {
+                "iteration": i,
+                "model_state_dict": extractor_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": mean_loss
+            },
+            checkpoint_path + "/" + extractor_model.type().name() + "_" + to_string(i) + "_" + to_string((int)mean_loss)
+        );
+    }
+}
