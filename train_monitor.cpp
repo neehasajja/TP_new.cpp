@@ -1,5 +1,4 @@
 #include <torch/torch.h>
-#include <matplotlibcpp.h>
 #include <iostream>
 
 void cvae_training_monitor(std::vector<double> mse_losses, std::vector<double> vlb_losses, std::string criterion) {
