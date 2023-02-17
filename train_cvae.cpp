@@ -1,6 +1,5 @@
 #include <torch/torch.h>
 #include <iostream>
-#include <tqdm/tqdm.h>
 #include <vector>
 #include <cmath>
 #include <numeric>
