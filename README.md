@@ -1,6 +1,11 @@
-This is Repo is under construction
-It is a cpp code for motion prediction.
+This is Repo is under construction.
 
-Download the dataset for the NN from here:
+Purpose: This is a repo where the existing python code from here https://github.com/kumgleb/Lyft_motion_prediction is written in cpp to check the perfomance comparision between the two languages.
+
+
+
+1.Download the dataset for the from here:
 https://www.woven-planet.global/en/data/prediction-dataset.
+
+
 
