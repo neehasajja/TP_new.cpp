@@ -1,237 +1,132 @@
-#include <unordered_map>
 #include <torch/torch.h>
 #include <torch/script.h>
-#include <torchvision/models/resnet.h>
+#include <torchvision/torchvision.h>
 
-#include <map>
-#include <vector>
-#include <string>
+using namespace torch;
+using namespace torch::nn;
+using namespace torchvision::models;
+using ModelTypes = torch::nn::AnyModule;
+using timm::models::efficientnet::EfficientNet;
+using timm::models::resnet::ResNet;
 
-// Embeddings consists of fully connected NN, with 2 linear layers and ReLu activation function.The Input is the Output of Resnet50 backbne.This module can be used to extract high-level features from the input data and generate emeddings which can be used for prediction and classification.//
+namespace {
 
-class Embeddings : public torch::nn::Module {
-public:
-    Embeddings(std::unordered_map<std::string, torch::Tensor> cfg) {
-        int num_history_channels = (cfg["model_params"]["history_num_frames"].item<int>() + 1) * 2;
-        int num_in_channels = 3 + num_history_channels;
+    std::map<std::string, int64_t> BACKBONE_OUT = {
+        {"efficientnet_b0", 1280},
+        {"efficientnet_b1", 1280},
+        {"efficientnet_b3", 1536},
+        {"seresnext26d_32x4d", 2048}
+    };
 
-        backbone = torchvision::models::resnet50(torch::nn::ResNetOptions(50).pretrained(true));
-        backbone_n_out = 2048;
-        n_head = cfg["embed_params"]["n_head"].item<int>();
-        emb_dim = cfg["embed_params"]["emb_dim"].item<int>();
+    using ModelTypes = torch::nn::ModuleHolder<EfficientNet, ResNet>;
 
-        // Adjust input channel for the Lyft data
-        backbone->conv1 = torch::nn::Conv2d(
-            torch::nn::Conv2dOptions(num_in_channels, backbone->conv1->options.out_channels)
-                .kernel_size(backbone->conv1->options.kernel_size)
-                .stride(backbone->conv1->options.stride)
-                .padding(backbone->conv1->options.padding)
+    nn::ModulePtr extend_input_channel(ModelTypes& model, int64_t channel_scale = 2) {
+        auto w = model.get()->backbone().conv_stem->weight;
+        int64_t num_hist = (w.size(1) - 3) / 2 - 1;
+
+        Tensor other_part = w.slice(1, 0, num_hist) * (channel_scale - 1);
+        other_part = torch::cat({other_part, w.slice(1, 0, num_hist + 1)}, 1);
+
+        Tensor target_part = w.slice(1, num_hist + 1, -4) * (channel_scale - 1);
+        target_part = torch::cat({target_part, w.slice(1, num_hist + 1, -3)}, 1);
+
+        Tensor map_part = w.slice(1, -3, w.size(1));
+
+        Tensor conv1_weight = torch::cat({other_part, target_part, map_part}, 1);
+        int64_t num_in_channels = (num_hist * channel_scale + 1) * 2 + 3;
+
+        model.get()->backbone().conv_stem = torch::nn::Conv2d(
+            torch::nn::Conv2dOptions(num_in_channels, 
+                                     model.get()->backbone().conv_stem->options().out_channels(), 
+                                     model.get()->backbone().conv_stem->options().kernel_size())
+                .stride(model.get()->backbone().conv_stem->options().stride())
+                .padding(model.get()->backbone().conv_stem->options().padding())
                 .bias(false)
         );
+        model.get()->backbone().conv_stem->weight = nn::Parameter(conv1_weight);
+        return model;
+    }
 
-        embeddings = torch::nn::Sequential(
-            torch::nn::Linear(torch::nn::LinearOptions(backbone_n_out, n_head)),
-            torch::nn::ReLU(),
-            torch::nn::Linear(n_head, emb_dim)
+torch::nn::AnyModule extend_1st_convw_ch(
+    ModelTypes& backbone,
+    const std::string& backbone_name,
+    const int num_in_channels
+) {
+    int extend_ch = num_in_channels / 3;
+    torch::Tensor w;
+    if (backbone_name.find("efficientnet") != std::string::npos) {
+        w = backbone.get_parameter("conv_stem.weight").detach();
+    } else {
+        w = backbone.get_parameter("conv1.0.weight").detach();
+    }
+
+    torch::Tensor conv1_weight;
+    if (num_in_channels - extend_ch * 3 > 0) {
+        conv1_weight = torch::cat(
+            {w.repeat({extend_ch, 1, 1, 1}), w.narrow(1, 0, num_in_channels - extend_ch * 3)},
+            1
         );
+    } else {
+        conv1_weight = w.repeat({extend_ch, 1, 1, 1});
     }
 
-    torch::Tensor forward(torch::Tensor x) {
-        x = backbone->conv1(x);
-        x = backbone->bn1(x);
-        x = backbone->relu(x);
-        x = backbone->maxpool(x);
-
-        x = backbone->layer1(x);
-        x = backbone->layer2(x);
-        x = backbone->layer3(x);
-        x = backbone->layer4(x);
-
-        x = backbone->avgpool(x);
-        x = x.flatten(1);
-
-        auto embeddings = this->embeddings(x);
-
-        return embeddings;
+    if (backbone_name.find("efficientnet") != std::string::npos) {
+        auto conv_stem = torch::nn::Conv2d(
+            torch::nn::Conv2dOptions(num_in_channels, backbone.get_parameter("conv_stem.weight").sizes()[1], backbone.get_parameter("conv_stem.weight").sizes()[2])
+                .stride(backbone.get_parameter("conv_stem.stride").tolist())
+                .padding(backbone.get_parameter("conv_stem.padding").tolist())
+                .bias(false)
+        );
+        conv_stem->weight = torch::nn::Parameter(conv1_weight);
+        backbone.register_module("conv_stem", conv_stem);
+        backbone.register_module("classifier", torch::nn::Identity());
+    } else {
+        auto conv1 = torch::nn::Conv2d(
+            torch::nn::Conv2dOptions(num_in_channels, backbone.get_parameter("conv1.0.weight").sizes()[0], backbone.get_parameter("conv1.0.weight").sizes()[2])
+                .stride(backbone.get_parameter("conv1.0.stride").tolist())
+                .padding(backbone.get_parameter("conv1.0.padding").tolist())
+                .bias(false)
+        );
+        conv1->weight = torch::nn::Parameter(conv1_weight);
+        backbone.register_module("conv1.0", conv1);
+        backbone.register_module("fc", torch::nn::Identity());
     }
 
-private:
-    torch::nn::Sequential embeddings;
-    int emb_dim;
-    int n_head;
-    int backbone_n_out;
-    torch::nn::Sequential backbone;
-};
+    return backbone;
+}
 
-//the constructor uses the unordered map taken by the encoder including latent_dim, frame_embedding_dim, and trajectory length//
-
-class Encoder : public torch::nn::Module  {
+class LyftMultiModelImpl : public nn::Module {
 public:
-   Encoder(const std::unordered_map<std::string, torch::Tensor>& cfg) : 
-        latent_dim(cfg.at("latent_dim").item<int>()),
-        frame_embedding_dim(cfg.at("frame_embedding_dim").item<int>()),
-        trajectory_length(cfg.at("trajectory_length").item<int>()),
-        layers_dims({trajectory_length + frame_embedding_dim}),
-        layers(torch::nn::Sequential()),// this represents the sequence of NN//
-        linear_means(torch::nn::Linear(layers_dims.back(), latent_dim)), //. These two linear layer areused to calculate the mean and log variance of the latent representation//
-        linear_log_var(torch::nn::Linear(layers_dims.back(), latent_dim)),
-};
+    LyftMultiModelImpl(map<string, map<string, map<string, float>>> cfg, int num_modes = 3, string backbone_name = "efficientnet_b1")
+        : future_len(cfg["model_params"]["future_num_frames"]),
+          num_modes(num_modes) {
+        int num_history_channels = (cfg["model_params"]["history_num_frames"] + 1) * 2;
+        int num_in_channels = 3 + num_history_channels;
+        backbone = torch::jit::load("path/to/backbone.pt"); // load the backbone model from a .pt file
 
-//
-class  Decoder : public torch::nn::Module {
-public:
-  Decoder(const std::unordered_map<std::string, int>& cfg) : cfg(cfg) {
-    trajectory_length = cfg.at("future_num_frames") * 2;
-    std::vector<int> layers = {
-        cfg.at("latent_dim") + cfg.at("emb_dim")
-    };
-    layers.insert(layers.end(), cfg.at("decoder_layers").begin(),
-                  cfg.at("decoder_layers").end());
-    layers_ = torch::nn::Sequential();
-    for (int i = 0; i < layers.size() - 1; ++i) {
-      layers_->push_back(
-          torch::nn::Linear(layers[i], layers[i + 1]));
-      layers_->push_back(torch::nn::ReLU());
+        // Extend 1st conv layer weight for multi-channel input
+        backbone = extend_1st_convw_ch(backbone, backbone_name, num_in_channels);
+
+        // Output shape: batch_sizex50x2
+        int num_targets = 2 * future_len;
+        num_preds = num_targets * num_modes;
+
+        int backbone_out_features = backbone.get()->output()->type()->expect<ListType>()->elements()[0]->expect<TensorType>()->sizes()[1];
+
+        // Linear layer
+        logit = register_module("logit", nn::Linear(backbone_out_features, num_preds + num_modes));
     }
-    reconstruction = torch::nn::Linear(layers.back(), trajectory_length);
-  }
 
-  torch::Tensor forward(torch::Tensor x, torch::Tensor emb) {
-    x = torch::cat({x, emb}, /*dim=*/1);
-    x = layers_(x);
-    x = reconstruction(x);
-    return x;
-  }
+    tuple<Tensor, Tensor> forward(Tensor x) {
+        Tensor feature = backbone.forward({x}).toTensor();
+        Tensor x_out = logit->forward(feature);
+        auto [pred, confidences] = torch::split(x_out, num_preds, 1);
 
- private:
-  int trajectory_length;
-  torch::nn::Sequential layers_;
-  torch::nn::Linear reconstruction;
-  const std::unordered_map<std::string, int>& cfg;
-};
+        // pred (batch_size)x(modes)x(time)x(2D coords)
+        // confidences (batch_size)x(modes)
+        int bs = x_out.size(0);
+        pred = pred.view({bs, num_modes, future_len, 2});
+        confidences = torch::softmax(confidences, 1);
 
-class CVAE(nn.Module):
-    //Conditional variational auto-encoder is to Perform future trajectory auto-encoding conditioned on frame and history embedding which Learnsthe  distribution P(trajectory | embedding)//
-  //
-    def __init__(self, cfg: Dict):
-        super().__init__()
-
-        self.encoder = Encoder(cfg)
-        self.decoder = Decoder(cfg)
-        self.embeddings = Embeddings(cfg)
-
-    def reparametrize(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def inference(self, z, context):
-        c = self.embeddings(context)
-        recon = self.decoder(z, c)
-        return recon
-
-    def forward(self, future_trj, context):
-        c = self.embeddings(context)
-        means, log_var = self.encoder(future_trj, c)
-        z = self.reparametrize(means, log_var)
-        recon = self.decoder(z, c)
-        return recon, means, log_var, z
-
-class TrajectoriesExtractor : public nn::Module {
- public:
-  TrajectoriesExtractor(const unordered_map<string, int>& cfg)
-      : n_samples_(cfg.at("n_samples")),
-        n_head_(cfg.at("n_head")),
-        p_drop_(cfg.at("p_drop")),
-        n_out_(cfg.at("future_num_frames") * 2),
-        n_channels_(cfg.at("n_channels")) {
-    extractor_ = nn::Sequential(
-        nn::Conv2d(1, n_channels_, {n_samples_, 1}, {1, 1}, {0, 0}),
-        nn::ReLU(),
-        nn::Conv2d(n_channels_, 1, {1, 1}, {1, 1}, {0, 0}),
-        nn::ReLU());
-
-    head1_ = nn::Sequential(
-        nn::Linear(200, n_head_),
-        nn::ReLU(),
-        nn::Dropout(p_drop_),
-        nn::Linear(n_head_, n_out_));
-    head2_ = nn::Sequential(
-        nn::Linear(200, n_head_),
-        nn::ReLU(),
-        nn::Dropout(p_drop_),
-        nn::Linear(n_head_, n_out_));
-    head3_ = nn::Sequential(
-        nn::Linear(200, n_head_),
-        nn::ReLU(),
-        nn::Dropout(p_drop_),
-        nn::Linear(n_head_, n_out_));
-  }
-
-  Tensor forward(const Tensor& x) {
-    Tensor f = extractor_->forward(x);
-    f = f.flatten(1);
-    Tensor x_mean = x.mean(2).view({-1, 100});
-    f = torch::cat({f, x_mean}, 1);
-
-    Tensor tr_1 = head1_->forward(f);
-    Tensor tr_2 = head2_->forward(f);
-    Tensor tr_3 = head3_->forward(f);
-
-    Tensor tr = torch::cat({tr_1, tr_2, tr_3}, 1);
-    tr = tr.view({-1, 3, 50, 2});
-    return tr;
-  }
-
- private:
-  int n_samples_;
-  int n_head_;
-  float p_drop_;
-  int n_out_;
-  int n_channels_;
-  nn::Sequential extractor_;
-  nn::Sequential head1_;
-  nn::Sequential head2_;
-  nn::Sequential head3_;
-};
-
-class TrajectoriesPredictor : public torch::nn::Module {
- public:
-  TrajectoriesPredictor(std::shared_ptr<torch::nn::Module> cvae_model,
-                        std::shared_ptr<torch::nn::Module> extractor_model,
-                        std::unordered_map<std::string, int> cfg,
-                        torch::Device device)
-      : cvae_model_(cvae_model),
-        extractor_model_(extractor_model),
-        cfg_(cfg),
-        device_(device) {}
-
-  torch::Tensor sample_trajectories_batch(torch::Tensor context) {
-    int n_samples = cfg_["extractor_cfg.n_samples"];
-    int n_time_steps = cfg_["model_params.future_num_frames"];
-    int bs = context.size(0);
-    torch::Tensor samples = torch::zeros({bs, 1, n_samples, 2 * n_time_steps});
-
-    for (int i = 0; i < n_samples; ++i) {
-      torch::Tensor z = torch::randn({bs, cfg_["cvae_cfg.latent_dim"]}).to(device_);
-      torch::Tensor trajectories = cvae_model_->forward(std::make_tuple(z, context)).to(device_);
-      samples[{{}, 0, i, {}}] = trajectories;
+        return make_tuple(pred, confidences);
     }
-    return samples;
-  }
-
-  torch::Tensor forward(std::unordered_map<std::string, torch::Tensor> x) {
-    torch::Tensor context = x["image"].to(device_);
-    torch::Tensor trajectories = sample_trajectories_batch(context).to(device_);
-    torch::Tensor predictions = extractor_model_->forward(trajectories);
-    return predictions;
-  }
-
- private:
-  std::shared_ptr<torch::nn::Module> cvae_model_;
-  std::shared_ptr<torch::nn::Module> extractor_model_;
-  std::unordered_map<std::string, int> cfg_;
-  torch::Device device_;
-};
-
-
