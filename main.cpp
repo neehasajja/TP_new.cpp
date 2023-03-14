@@ -22,9 +22,6 @@
 #include "lyft_models.hpp"
 #include "lyft_utils.hpp"
 
-#include <iostream>
-#include <random>
-#include <string>
 
 const int VAL_INTERVAL_SAMPLES = 250000;
 const int ALL_DATA_SIZE = 198474478;
